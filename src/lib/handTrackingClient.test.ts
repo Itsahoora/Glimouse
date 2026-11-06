@@ -31,14 +31,20 @@ class FakeWorker implements WorkerPort {
   }
 
   emitError(message: string): void {
-    const event = new ErrorEvent('error', { message });
+    const event = createErrorEvent(message);
     this.listeners.get('error')?.forEach((listener) => listener(event));
   }
 
   emitQueuedError(message: string): void {
-    const event = new ErrorEvent('error', { message });
+    const event = createErrorEvent(message);
     this.originalListeners.get('error')?.forEach((listener) => listener(event));
   }
+}
+
+function createErrorEvent(message: string): ErrorEvent {
+  const event = new Event('error');
+  Object.defineProperty(event, 'message', { value: message });
+  return event as ErrorEvent;
 }
 
 function setup(session = 1, timeouts = { initializationMs: 100, inferenceMs: 50 }) {
