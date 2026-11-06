@@ -40,6 +40,12 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Build cursor companion
+        run: dotnet build .\native\GestureMouse.CursorCompanion\GestureMouse.CursorCompanion.csproj --configuration Release
+
+      - name: Test native command state
+        run: dotnet run --project .\native\GestureMouse.CommandState.Tests\GestureMouse.CommandState.Tests.csproj --configuration Release
+
       - name: Publish Windows app
         run: dotnet publish .\native\GestureMouse.TrayHost\GestureMouse.TrayHost.csproj -c Release -r win-x64 --self-contained false
 

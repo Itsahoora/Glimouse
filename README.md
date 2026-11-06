@@ -16,6 +16,7 @@ Glimouse is a local-first hand-gesture mouse for Windows. It uses a webcam and M
 ## Download and run
 
 Glimouse runs on 64-bit Windows and requires the Microsoft Edge WebView2 Runtime and a webcam.
+The latest published release is `v0.1.0`.
 
 1. Download the latest `Glimouse-*-win-x64.zip` from the repository's **Releases** page.
 2. Extract the entire archive.
@@ -30,8 +31,9 @@ The app stays in the notification area when its window is closed. Choose **Exit*
 Pushing a version tag that starts with `v` runs the Windows release workflow. It tests and builds the project, then publishes the self-contained x64 app and attaches a ZIP containing the executable, supporting files, and MIT license to a GitHub Release.
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+$version = "vX.Y.Z"
+git tag $version
+git push origin $version
 ```
 
 ## Development
@@ -74,10 +76,13 @@ npm ci
 npm run lint
 npm test
 npm run build
+dotnet build .\native\GestureMouse.CursorCompanion\GestureMouse.CursorCompanion.csproj
+dotnet build .\native\GestureMouse.TrayHost\GestureMouse.TrayHost.csproj
+dotnet run --project .\native\GestureMouse.CommandState.Tests\GestureMouse.CommandState.Tests.csproj --configuration Release
 dotnet publish .\native\GestureMouse.TrayHost\GestureMouse.TrayHost.csproj -c Release -r win-x64 --self-contained false
 ```
 
-The frontend checks and Windows publish are also run by GitHub Actions for pushes and pull requests to `main`.
+GitHub Actions runs the frontend checks, builds the cursor companion, runs the native command-state scenarios, and publishes the tray app for pushes and pull requests to `main`.
 
 ## Privacy and safety
 

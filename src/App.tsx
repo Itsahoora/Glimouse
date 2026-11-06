@@ -1,15 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   clamp,
   createCursorFilterState,
   detectGestureState,
   filterCursorTarget,
   mapNormalizedToScreen,
+  toPhysicalScreenCoordinates,
   updatePinchAction,
   type CalibratedScreen,
   type Point2D,
   type PinchActionState,
 } from './lib/mouseMath';
+import { HandTrackingClient } from './lib/handTrackingClient';
+import {
+  getNativeFailureMessage,
+  NativeMouseCommands,
+} from './lib/nativeMouseCommands';
+import { finishTrackingStop } from './lib/trackingStop';
+import {
+  applyMouseInputSettingsChange,
+  canProcessMouseInput,
+  updatePinchSuppression,
+} from './lib/mouseInputSafety';
+import { defaultSettings, parseSettings, type Settings } from './lib/settings';
 import './App.css';
 
 type CameraStatus = 'idle' | 'starting' | 'ready' | 'error';
@@ -19,29 +32,6 @@ type EventEntry = {
   id: number;
   message: string;
   tone: EventTone;
-};
-
-type Settings = {
-  sensitivity: number;
-  smoothing: number;
-  enableCursor: boolean;
-  enablePinchActions: boolean;
-  enableScroll: boolean;
-  mirrorPreview: boolean;
-};
-
-type HandWorkerMessage =
-  | { type: 'ready' }
-  | { type: 'result'; landmarks: Point2D[] | null }
-  | { type: 'error'; message: string };
-
-const defaultSettings: Settings = {
-  sensitivity: 1.05,
-  smoothing: 0.58,
-  enableCursor: false,
-  enablePinchActions: false,
-  enableScroll: false,
-  mirrorPreview: false,
 };
 
 const DEFAULT_CALIBRATION: CalibratedScreen = {
@@ -67,41 +57,26 @@ function readSavedSettings(): Settings {
   }
 
   try {
-    const raw = window.localStorage.getItem('gestureMouse.settings');
-    if (!raw) {
-      return defaultSettings;
-    }
-
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      return defaultSettings;
-    }
-
-    const saved = parsed as Record<string, unknown>;
-    const numericSetting = (key: 'sensitivity' | 'smoothing', minimum: number, maximum: number) => {
-      const value = saved[key];
-      return typeof value === 'number' && Number.isFinite(value)
-        ? clamp(value, minimum, maximum)
-        : defaultSettings[key];
-    };
-    const booleanSetting = (key: 'enableCursor' | 'enableScroll' | 'mirrorPreview') => {
-      const value = saved[key];
-      return typeof value === 'boolean' ? value : defaultSettings[key];
-    };
-    const pinchActions = saved.enablePinchActions;
-
-    return {
-      sensitivity: numericSetting('sensitivity', 0.4, 2),
-      smoothing: numericSetting('smoothing', 0.1, 0.9),
-      enableCursor: booleanSetting('enableCursor'),
-      enablePinchActions: typeof pinchActions === 'boolean'
-        ? pinchActions
-        : Boolean(saved.enableClick || saved.enableDrag),
-      enableScroll: booleanSetting('enableScroll'),
-      mirrorPreview: booleanSetting('mirrorPreview'),
-    };
+    return parseSettings(window.localStorage.getItem('gestureMouse.settings'));
   } catch {
     return defaultSettings;
+  }
+}
+
+function readNativeClientId(): string {
+  const key = 'gestureMouse.nativeClientId';
+  try {
+    const stored = window.localStorage.getItem(key);
+    if (stored) {
+      return stored;
+    }
+
+    const id = globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    window.localStorage.setItem(key, id);
+    return id;
+  } catch {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   }
 }
 
@@ -110,9 +85,8 @@ function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const trackingTimerRef = useRef<number | null>(null);
-  const handWorkerRef = useRef<Worker | null>(null);
-  const workerReadyRef = useRef(false);
-  const workerReadyPromiseRef = useRef<Promise<void> | null>(null);
+  const handTrackingClientRef = useRef<HandTrackingClient | null>(null);
+  const handTrackingWorkerIdentityRef = useRef<symbol | null>(null);
   const framePendingRef = useRef(false);
   const trackingSessionRef = useRef(0);
   const cursorFilterRef = useRef(createCursorFilterState());
@@ -122,14 +96,21 @@ function App() {
   const lastVideoTimeRef = useRef(-1);
   const cursorRequestPendingRef = useRef(false);
   const latestCursorTargetRef = useRef<Point2D | null>(null);
-  const commandQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const cursorRequestIdRef = useRef(0);
+  const scrollRequestIdRef = useRef(0);
   const pinchActionStateRef = useRef<PinchActionState>({ startedAt: null, dragging: false });
+  const suppressPinchUntilReleaseRef = useRef(false);
   const scrollAnchorRef = useRef<number | null>(null);
   const leftButtonHeldRef = useRef(false);
   const lastScrollSendRef = useRef(0);
   const scrollRequestPendingRef = useRef(false);
   const pendingScrollDeltaRef = useRef(0);
   const settingsRef = useRef(defaultSettings);
+  const mountedRef = useRef(true);
+  const nativeWasReadyRef = useRef(false);
+  const nativeHasConnectedRef = useRef(false);
+  const processLandmarksRef = useRef<(landmarks: Point2D[] | null, session: number) => void>(() => {});
+  const workerFailureRef = useRef<(session: number, message: string) => void>(() => {});
 
   const [settings, setSettings] = useState<Settings>(readSavedSettings);
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>('idle');
@@ -145,15 +126,75 @@ function App() {
     { id: 1, message: 'Glimouse ready for camera calibration.', tone: 'info' },
     { id: 2, message: 'Movement mode is disabled until you opt in.', tone: 'warn' },
   ]);
+  const settingsStorageWarningShownRef = useRef(false);
 
   const addEvent = useCallback((message: string, tone: EventTone = 'info') => {
     setEvents((items) => [{ id: Date.now() + Math.random(), message, tone }, ...items].slice(0, 6));
   }, []);
 
+  const [nativeMouseCommands] = useState(() => new NativeMouseCommands(
+      (path, body, signal) => fetch(`http://127.0.0.1:5103${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal,
+      }),
+      undefined,
+      undefined,
+      readNativeClientId(),
+    ));
+
+  useEffect(() => {
+    nativeMouseCommands.setFailureHandler((path, error) => {
+      if (!mountedRef.current) {
+        return;
+      }
+      setCursorMode('offline');
+      addEvent(getNativeFailureMessage(path, error), 'error');
+      console.error(error);
+    });
+    nativeMouseCommands.setConnectionStateHandler((ready) => {
+      if (!mountedRef.current) {
+        return;
+      }
+      const hadBeenReady = nativeWasReadyRef.current;
+      nativeWasReadyRef.current = ready;
+      setCompanionReady(ready);
+      if (ready && nativeHasConnectedRef.current && !hadBeenReady) {
+        addEvent('The companion session was restored with a fresh mouse session.', 'success');
+      } else if (!ready && hadBeenReady) {
+        addEvent('The companion session was lost. Reconnecting without replaying old mouse actions.', 'warn');
+      }
+      if (ready) {
+        nativeHasConnectedRef.current = true;
+      }
+      if (!ready) {
+        setCursorMode('offline');
+        leftButtonHeldRef.current = false;
+        pinchActionStateRef.current = { startedAt: null, dragging: false };
+        wasPinchingRef.current = false;
+        suppressPinchUntilReleaseRef.current = true;
+        scrollAnchorRef.current = null;
+        pendingScrollDeltaRef.current = 0;
+        scrollRequestPendingRef.current = false;
+        cursorRequestPendingRef.current = false;
+        latestCursorTargetRef.current = null;
+      }
+    });
+  }, [addEvent, nativeMouseCommands]);
+
   useEffect(() => {
     settingsRef.current = settings;
-    window.localStorage.setItem('gestureMouse.settings', JSON.stringify(settings));
-  }, [settings]);
+    try {
+      window.localStorage.setItem('gestureMouse.settings', JSON.stringify(settings));
+    } catch (error) {
+      if (!settingsStorageWarningShownRef.current) {
+        settingsStorageWarningShownRef.current = true;
+        addEvent('Settings could not be saved in this browser profile.', 'warn');
+        console.warn(error);
+      }
+    }
+  }, [addEvent, settings]);
 
   const statusSummary = useMemo(() => {
     if (cameraStatus === 'starting') {
@@ -170,40 +211,21 @@ function App() {
 
   const testCursorCompanion = useCallback(async () => {
     try {
-      const response = await fetch('http://127.0.0.1:5103/health');
-      if (!response.ok) {
-        throw new Error('Companion status not healthy');
+      await nativeMouseCommands.connect();
+      if (!mountedRef.current) {
+        return;
       }
       setCompanionReady(true);
       addEvent('Cursor companion connected and listening locally.', 'success');
     } catch (error) {
+      if (!mountedRef.current) {
+        return;
+      }
       setCompanionReady(false);
       addEvent('Cursor companion is not running yet. Start it from native/GestureMouse.CursorCompanion.', 'warn');
       console.warn(error);
     }
-  }, [addEvent]);
-
-  const sendNativeCommand = useCallback((path: string, body?: object) => {
-    const request = async () => {
-      const response = await fetch(`http://127.0.0.1:5103${path}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body ?? {}),
-      });
-      if (!response.ok) {
-        throw new Error(`Native command failed: ${path} (${response.status})`);
-      }
-    };
-
-    commandQueueRef.current = commandQueueRef.current
-      .then(request)
-      .catch((error: unknown) => {
-        setCursorMode('offline');
-        addEvent('A mouse action was rejected by the local companion.', 'error');
-        console.error(error);
-      });
-    return commandQueueRef.current;
-  }, [addEvent]);
+  }, [addEvent, nativeMouseCommands]);
 
   const loadCameraDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) {
@@ -265,8 +287,12 @@ function App() {
     }
   }, []);
 
-  const sendCursorMove = useCallback(async (screenX: number, screenY: number) => {
-    if (!settingsRef.current.enableCursor || !companionReady) {
+  const sendCursorMove = useCallback(async (screenX: number, screenY: number, session: number) => {
+    if (
+      session !== trackingSessionRef.current
+      || !canProcessMouseInput(settingsRef.current)
+      || !companionReady
+    ) {
       return;
     }
 
@@ -276,37 +302,56 @@ function App() {
       return;
     }
     cursorRequestPendingRef.current = true;
+    const requestId = ++cursorRequestIdRef.current;
 
     try {
       while (latestCursorTargetRef.current) {
+        if (
+          session !== trackingSessionRef.current
+          || !canProcessMouseInput(settingsRef.current)
+          || !companionReady
+        ) {
+          return;
+        }
         const target = latestCursorTargetRef.current;
         latestCursorTargetRef.current = null;
         lastPointerSendRef.current = performance.now();
-        const response = await fetch('http://127.0.0.1:5103/cursor/move', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            x: Math.round(clamp(target.x, 0, Math.max((window.screen.width || 1920) - 1, 0))),
-            y: Math.round(clamp(target.y, 0, Math.max((window.screen.height || 1080) - 1, 0))),
-          }),
-        });
-
-        if (!response.ok) {
-          throw new Error(`Movement request failed (${response.status})`);
-        }
+        const physicalTarget = toPhysicalScreenCoordinates(
+          target,
+          {
+            width: window.screen.width || 1920,
+            height: window.screen.height || 1080,
+          },
+          window.devicePixelRatio,
+        );
+        await nativeMouseCommands.move(session, physicalTarget.x, physicalTarget.y);
       }
 
-      setCursorMode('movement');
+      if (
+        session === trackingSessionRef.current
+        && canProcessMouseInput(settingsRef.current)
+        && companionReady
+      ) {
+        setCursorMode('movement');
+      }
     } catch (error) {
+      if (session !== trackingSessionRef.current) {
+        return;
+      }
       setCursorMode('offline');
-      addEvent('The cursor companion rejected a movement request.', 'warn');
+      addEvent('The cursor companion failed to complete a movement request.', 'warn');
       console.warn(error);
     } finally {
-      cursorRequestPendingRef.current = false;
+      if (requestId === cursorRequestIdRef.current) {
+        cursorRequestPendingRef.current = false;
+      }
     }
-  }, [addEvent, companionReady]);
+  }, [addEvent, companionReady, nativeMouseCommands]);
 
-  const processLandmarks = useCallback((landmarks: Point2D[] | null) => {
+  const processLandmarks = useCallback((landmarks: Point2D[] | null, session: number) => {
+    if (session !== trackingSessionRef.current) {
+      return;
+    }
     const now = performance.now();
     const deltaSeconds = lastInferenceTimeRef.current === 0
       ? 1 / 30
@@ -319,26 +364,43 @@ function App() {
       setGestureName('No hand');
       setCursorMode('standby');
       if (leftButtonHeldRef.current) {
-        void sendNativeCommand('/mouse/left', { pressed: false });
+        void nativeMouseCommands.setLeftButton(session, false);
         leftButtonHeldRef.current = false;
       }
       pinchActionStateRef.current = { startedAt: null, dragging: false };
       wasPinchingRef.current = false;
+      suppressPinchUntilReleaseRef.current = false;
       scrollAnchorRef.current = null;
+      pendingScrollDeltaRef.current = 0;
       drawHandOverlay(null);
       return;
     }
 
     const detectedGesture = detectGestureState(landmarks, wasPinchingRef.current);
     wasPinchingRef.current = detectedGesture.pinch;
+    const pinchSuppression = updatePinchSuppression({
+      leftButtonHeld: leftButtonHeldRef.current,
+      pinchStartedAt: pinchActionStateRef.current.startedAt,
+      dragging: pinchActionStateRef.current.dragging,
+      wasPinching: wasPinchingRef.current,
+      scrollAnchor: scrollAnchorRef.current,
+      pendingScrollDelta: pendingScrollDeltaRef.current,
+      scrollRequestPending: scrollRequestPendingRef.current,
+      cursorRequestPending: cursorRequestPendingRef.current,
+      latestCursorTarget: latestCursorTargetRef.current,
+      suppressPinchUntilRelease: suppressPinchUntilReleaseRef.current,
+    }, detectedGesture.pinch);
+    suppressPinchUntilReleaseRef.current = pinchSuppression.suppressPinchUntilRelease;
     const pinchState = settingsRef.current.enablePinchActions
+      && !suppressPinchUntilReleaseRef.current
       ? updatePinchAction(pinchActionStateRef.current, detectedGesture.pinch, now)
       : { state: { startedAt: null, dragging: false }, action: 'none' as const };
     pinchActionStateRef.current = pinchState.state;
     setGestureName(detectedGesture.name);
 
-    if (settingsRef.current.enableCursor && detectedGesture.active) {
+    if (canProcessMouseInput(settingsRef.current) && detectedGesture.active) {
       const isPinchingBeforeDrag = settingsRef.current.enablePinchActions
+        && !suppressPinchUntilReleaseRef.current
         && detectedGesture.pinch
         && !pinchState.state.dragging;
       if (!isPinchingBeforeDrag) {
@@ -358,18 +420,18 @@ function App() {
           deltaSeconds,
         );
         cursorFilterRef.current = filtered.state;
-        void sendCursorMove(filtered.point.x, filtered.point.y);
+        void sendCursorMove(filtered.point.x, filtered.point.y, session);
       }
 
       if (pinchState.action === 'drag-start') {
-        void sendNativeCommand('/mouse/left', { pressed: true });
+        void nativeMouseCommands.setLeftButton(session, true);
         leftButtonHeldRef.current = true;
       } else if (pinchState.action === 'drag-end') {
-        void sendNativeCommand('/mouse/left', { pressed: false });
+        void nativeMouseCommands.setLeftButton(session, false);
         leftButtonHeldRef.current = false;
       } else if (pinchState.action === 'click') {
-        void sendNativeCommand('/mouse/left', { pressed: true });
-        void sendNativeCommand('/mouse/left', { pressed: false });
+        void nativeMouseCommands.setLeftButton(session, true);
+        void nativeMouseCommands.setLeftButton(session, false);
       }
 
       if (settingsRef.current.enableScroll && detectedGesture.openPalm) {
@@ -386,22 +448,12 @@ function App() {
             pendingScrollDeltaRef.current -= delta;
             lastScrollSendRef.current = now;
             scrollRequestPendingRef.current = true;
-            void fetch('http://127.0.0.1:5103/mouse/scroll', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ delta }),
-            })
-              .then((response) => {
-                if (!response.ok) {
-                  throw new Error(`Scroll request failed (${response.status})`);
-                }
-              })
-              .catch((error: unknown) => {
-                addEvent('The local companion rejected a scroll request.', 'error');
-                console.error(error);
-              })
+            const requestId = ++scrollRequestIdRef.current;
+            void nativeMouseCommands.scroll(session, delta)
               .finally(() => {
-                scrollRequestPendingRef.current = false;
+                if (requestId === scrollRequestIdRef.current) {
+                  scrollRequestPendingRef.current = false;
+                }
               });
           }
         }
@@ -411,57 +463,154 @@ function App() {
       }
     } else {
       if (leftButtonHeldRef.current) {
-        void sendNativeCommand('/mouse/left', { pressed: false });
+        void nativeMouseCommands.setLeftButton(session, false);
         leftButtonHeldRef.current = false;
       }
       pinchActionStateRef.current = { startedAt: null, dragging: false };
       wasPinchingRef.current = false;
       scrollAnchorRef.current = null;
+      pendingScrollDeltaRef.current = 0;
     }
 
     if (!settingsRef.current.enablePinchActions && leftButtonHeldRef.current) {
-      void sendNativeCommand('/mouse/left', { pressed: false });
+      void nativeMouseCommands.setLeftButton(session, false);
       leftButtonHeldRef.current = false;
     }
 
+    if (!canProcessMouseInput(settingsRef.current)) {
+      scrollAnchorRef.current = null;
+      pendingScrollDeltaRef.current = 0;
+    }
+
     drawHandOverlay(landmarks);
-  }, [addEvent, calibration, drawHandOverlay, sendCursorMove, sendNativeCommand]);
+  }, [calibration, drawHandOverlay, nativeMouseCommands, sendCursorMove]);
+  useLayoutEffect(() => {
+    processLandmarksRef.current = processLandmarks;
+  }, [processLandmarks]);
 
-  const stopTracking = useCallback(async () => {
-    trackingSessionRef.current += 1;
+  const changeInputSettings = useCallback((next: Settings) => {
+    const change = applyMouseInputSettingsChange(
+      settingsRef.current,
+      next,
+      {
+        leftButtonHeld: leftButtonHeldRef.current,
+        pinchStartedAt: pinchActionStateRef.current.startedAt,
+        dragging: pinchActionStateRef.current.dragging,
+        wasPinching: wasPinchingRef.current,
+        scrollAnchor: scrollAnchorRef.current,
+        pendingScrollDelta: pendingScrollDeltaRef.current,
+        scrollRequestPending: scrollRequestPendingRef.current,
+        cursorRequestPending: cursorRequestPendingRef.current,
+        latestCursorTarget: latestCursorTargetRef.current,
+        suppressPinchUntilRelease: suppressPinchUntilReleaseRef.current,
+      },
+      () => {
+        const session = trackingSessionRef.current;
+        if (session > 0) {
+          void nativeMouseCommands.releaseLeftButton(session);
+        }
+      },
+    );
+    const { reset, state } = change;
+    if (reset.releaseButton) {
+      leftButtonHeldRef.current = state.leftButtonHeld;
+      pinchActionStateRef.current = {
+        startedAt: state.pinchStartedAt,
+        dragging: state.dragging,
+      };
+      wasPinchingRef.current = state.wasPinching;
+      suppressPinchUntilReleaseRef.current = state.suppressPinchUntilRelease;
+
+      if (reset.movementDisabled) {
+        setCursorMode('standby');
+        cursorRequestIdRef.current += 1;
+        cursorRequestPendingRef.current = state.cursorRequestPending;
+        latestCursorTargetRef.current = state.latestCursorTarget;
+        scrollRequestIdRef.current += 1;
+        scrollAnchorRef.current = state.scrollAnchor;
+        pendingScrollDeltaRef.current = state.pendingScrollDelta;
+        scrollRequestPendingRef.current = state.scrollRequestPending;
+      }
+    }
+
+    settingsRef.current = next;
+    setSettings(next);
+  }, [nativeMouseCommands]);
+
+  const stopTracking = useCallback(() => finishTrackingStop(
+    () => {
+      const stoppedSession = trackingSessionRef.current;
+      trackingSessionRef.current += 1;
+      const trackingClient = handTrackingClientRef.current;
+      handTrackingClientRef.current = null;
+      handTrackingWorkerIdentityRef.current = null;
+      trackingClient?.cancelSession(stoppedSession);
+      trackingClient?.terminate();
+      framePendingRef.current = false;
+      cursorRequestIdRef.current += 1;
+      cursorRequestPendingRef.current = false;
+      latestCursorTargetRef.current = null;
+      scrollRequestIdRef.current += 1;
+      const stream = streamRef.current;
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+
+      if (trackingTimerRef.current !== null) {
+        window.clearTimeout(trackingTimerRef.current);
+        trackingTimerRef.current = null;
+      }
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+
+      setCameraStatus('idle');
+      setSurfaceReady(false);
+      setHandDetected(false);
+      setGestureName('No hand');
+      setCursorMode('standby');
+      pinchActionStateRef.current = { startedAt: null, dragging: false };
+      wasPinchingRef.current = false;
+      suppressPinchUntilReleaseRef.current = false;
+      cursorFilterRef.current = createCursorFilterState();
+      scrollAnchorRef.current = null;
+      pendingScrollDeltaRef.current = 0;
+      scrollRequestPendingRef.current = false;
+      leftButtonHeldRef.current = false;
+      lastInferenceTimeRef.current = 0;
+      lastVideoTimeRef.current = -1;
+    },
+    () => nativeMouseCommands.invalidateAndRelease(),
+    (status, error) => {
+      if (!mountedRef.current) {
+        return;
+      }
+      addEvent(status.message, status.tone);
+      if (!status.released) {
+        console.error(error);
+      }
+    },
+  ), [addEvent, nativeMouseCommands]);
+
+  const handleWorkerFailure = useCallback((session: number, message: string) => {
+    if (session !== trackingSessionRef.current) {
+      return;
+    }
+
     framePendingRef.current = false;
-    const stream = streamRef.current;
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-
-    if (trackingTimerRef.current !== null) {
-      window.clearTimeout(trackingTimerRef.current);
-      trackingTimerRef.current = null;
-    }
-
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-
-    setCameraStatus('idle');
-    setSurfaceReady(false);
-    setHandDetected(false);
-    setGestureName('No hand');
-    setCursorMode('standby');
-    pinchActionStateRef.current = { startedAt: null, dragging: false };
-    wasPinchingRef.current = false;
-    cursorFilterRef.current = createCursorFilterState();
-    scrollAnchorRef.current = null;
-    pendingScrollDeltaRef.current = 0;
-    scrollRequestPendingRef.current = false;
-    leftButtonHeldRef.current = false;
-    lastInferenceTimeRef.current = 0;
-    lastVideoTimeRef.current = -1;
-
-    await sendNativeCommand('/cursor/stop');
-  }, [sendNativeCommand]);
+    addEvent(`Hand tracking worker failed: ${message}`, 'error');
+    console.error(message);
+    void stopTracking().finally(() => {
+      if (trackingSessionRef.current === session + 1) {
+        setCameraStatus('error');
+      }
+    });
+  }, [addEvent, stopTracking]);
+  useLayoutEffect(() => {
+    workerFailureRef.current = handleWorkerFailure;
+  }, [handleWorkerFailure]);
 
   const startTracking = useCallback(async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -472,8 +621,14 @@ function App() {
 
     const session = ++trackingSessionRef.current;
     try {
+      await nativeMouseCommands.connect();
+      if (session !== trackingSessionRef.current) {
+        return;
+      }
+      nativeMouseCommands.beginTrackingSession(session);
       cursorFilterRef.current = createCursorFilterState();
       wasPinchingRef.current = false;
+      suppressPinchUntilReleaseRef.current = false;
       setCameraStatus('starting');
       await loadCameraDevices();
       if (session !== trackingSessionRef.current) {
@@ -494,6 +649,16 @@ function App() {
       }
 
       streamRef.current = stream;
+      stream.getVideoTracks().forEach((track) => {
+        track.addEventListener('ended', () => {
+          if (session !== trackingSessionRef.current) {
+            return;
+          }
+
+          addEvent('The camera disconnected. Stopping tracking.', 'error');
+          void stopTracking().finally(() => setCameraStatus('error'));
+        }, { once: true });
+      });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
@@ -505,71 +670,33 @@ function App() {
       setSurfaceReady(true);
       addEvent('Camera stream started; initializing hand tracking.', 'info');
 
-      let handWorker = handWorkerRef.current;
-      if (!handWorker) {
-        handWorker = new Worker(new URL('./workers/handTracking.worker.ts', import.meta.url));
-        handWorkerRef.current = handWorker;
-      }
-
-      handWorker.onmessage = (event: MessageEvent<HandWorkerMessage>) => {
-        const message = event.data;
-        if (message.type === 'ready') {
-          workerReadyRef.current = true;
-          return;
-        }
-        if (message.type === 'error') {
-          framePendingRef.current = false;
-          addEvent(`Hand tracking worker failed: ${message.message}`, 'error');
-          console.error(message.message);
-          void stopTracking().finally(() => setCameraStatus('error'));
-          return;
-        }
-
-        framePendingRef.current = false;
-        processLandmarks(message.landmarks);
-      };
-      if (!workerReadyRef.current) {
-        workerReadyPromiseRef.current ??= new Promise<void>((resolve, reject) => {
-          const worker = handWorkerRef.current;
-          if (!worker) {
-            reject(new Error('Hand tracking worker was not created.'));
+      const worker = new Worker(new URL('./workers/handTracking.worker.ts', import.meta.url));
+      const workerIdentity = Symbol('hand-tracking-worker');
+      handTrackingWorkerIdentityRef.current = workerIdentity;
+      const trackingClient = new HandTrackingClient(worker, session, {
+        onResult: (messageSession, landmarks) => {
+          if (messageSession !== trackingSessionRef.current) {
             return;
           }
-          const previousHandler = worker.onmessage;
-          worker.onmessage = (event: MessageEvent<HandWorkerMessage>) => {
-            const message = event.data;
-            if (message.type === 'ready') {
-              workerReadyRef.current = true;
-              worker.onmessage = previousHandler;
-              resolve();
-              return;
-            }
-            if (message.type === 'error') {
-              worker.onmessage = previousHandler;
-              workerReadyPromiseRef.current = null;
-              reject(new Error(message.message));
-            }
-          };
-          worker.addEventListener('error', (event) => {
-            workerReadyPromiseRef.current = null;
-            reject(new Error(event.message || 'The hand tracking worker could not start.'));
-          }, { once: true });
-          worker.postMessage({ type: 'init' });
-        });
-        await workerReadyPromiseRef.current;
-      }
+          framePendingRef.current = false;
+          processLandmarksRef.current(landmarks, messageSession);
+        },
+        onError: (messageSession, message) => {
+          if (handTrackingWorkerIdentityRef.current !== workerIdentity) {
+            return;
+          }
+          workerFailureRef.current(messageSession, message);
+        },
+      });
+      handTrackingClientRef.current = trackingClient;
+
+      await trackingClient.initialize(session);
 
       if (session !== trackingSessionRef.current) {
         return;
       }
 
       setCameraStatus('ready');
-      handWorker.onerror = (event) => {
-        framePendingRef.current = false;
-        addEvent(`Hand tracking worker failed: ${event.message}`, 'error');
-        console.error(event.message);
-        void stopTracking().finally(() => setCameraStatus('error'));
-      };
 
       const scan = () => {
         const video = videoRef.current;
@@ -588,14 +715,18 @@ function App() {
           const frameSession = session;
           void createImageBitmap(video)
             .then((bitmap) => {
-              if (frameSession !== trackingSessionRef.current || !handWorkerRef.current) {
+              if (frameSession !== trackingSessionRef.current || !trackingClient) {
                 bitmap.close();
-                framePendingRef.current = false;
                 return;
               }
-              handWorkerRef.current.postMessage({ type: 'frame', bitmap }, [bitmap]);
+              if (!trackingClient.postFrame(frameSession, bitmap) && frameSession === trackingSessionRef.current) {
+                framePendingRef.current = false;
+              }
             })
             .catch((error: unknown) => {
+              if (frameSession !== trackingSessionRef.current) {
+                return;
+              }
               framePendingRef.current = false;
               addEvent('Unable to prepare a camera frame for hand tracking.', 'error');
               console.error(error);
@@ -610,6 +741,14 @@ function App() {
       if (session !== trackingSessionRef.current) {
         return;
       }
+      trackingSessionRef.current += 1;
+      const trackingClient = handTrackingClientRef.current;
+      handTrackingClientRef.current = null;
+      handTrackingWorkerIdentityRef.current = null;
+      if (trackingClient) {
+        trackingClient.cancelSession(session);
+        trackingClient.terminate();
+      }
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       if (trackingTimerRef.current !== null) {
@@ -619,11 +758,25 @@ function App() {
       if (videoRef.current) {
         videoRef.current.srcObject = null;
       }
-      handWorkerRef.current?.terminate();
-      handWorkerRef.current = null;
-      workerReadyRef.current = false;
-      workerReadyPromiseRef.current = null;
       framePendingRef.current = false;
+      cursorRequestIdRef.current += 1;
+      cursorRequestPendingRef.current = false;
+      latestCursorTargetRef.current = null;
+      scrollRequestIdRef.current += 1;
+      leftButtonHeldRef.current = false;
+      pinchActionStateRef.current = { startedAt: null, dragging: false };
+      wasPinchingRef.current = false;
+      suppressPinchUntilReleaseRef.current = false;
+      scrollAnchorRef.current = null;
+      pendingScrollDeltaRef.current = 0;
+      scrollRequestPendingRef.current = false;
+      void nativeMouseCommands.invalidateAndRelease().catch((releaseError: unknown) => {
+        addEvent(
+          'Tracking stopped, but native mouse-button release could not be confirmed.',
+          'error',
+        );
+        console.error(releaseError);
+      });
       setSurfaceReady(false);
       setCameraStatus('error');
       const isCameraError = error instanceof DOMException;
@@ -642,7 +795,7 @@ function App() {
       addEvent(`Unable to ${failureType} (${errorName}: ${errorMessage}).${guidance}`, 'error');
       console.error(error);
     }
-  }, [addEvent, loadCameraDevices, processLandmarks, selectedCameraId, stopTracking]);
+  }, [addEvent, loadCameraDevices, nativeMouseCommands, selectedCameraId, stopTracking]);
 
   useEffect(() => {
     let active = true;
@@ -670,10 +823,21 @@ function App() {
   }, [addEvent, testCursorCompanion]);
 
   useEffect(() => {
+    mountedRef.current = true;
     const video = videoRef.current;
     return () => {
+      mountedRef.current = false;
+      const stoppedSession = trackingSessionRef.current;
       trackingSessionRef.current += 1;
+      const trackingClient = handTrackingClientRef.current;
+      handTrackingClientRef.current = null;
+      handTrackingWorkerIdentityRef.current = null;
+      trackingClient?.cancelSession(stoppedSession);
       framePendingRef.current = false;
+      cursorRequestIdRef.current += 1;
+      cursorRequestPendingRef.current = false;
+      latestCursorTargetRef.current = null;
+      scrollRequestIdRef.current += 1;
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       if (trackingTimerRef.current !== null) {
@@ -683,21 +847,12 @@ function App() {
       if (video) {
         video.srcObject = null;
       }
-      handWorkerRef.current?.terminate();
-      handWorkerRef.current = null;
-      workerReadyRef.current = false;
-      workerReadyPromiseRef.current = null;
-      void fetch('http://127.0.0.1:5103/cursor/stop', { method: 'POST' })
-        .then((response) => {
-          if (!response.ok) {
-            throw new Error(`Cursor release failed (${response.status})`);
-          }
-        })
-        .catch((error: unknown) => {
-          console.error('Unable to release native mouse buttons during cleanup.', error);
-        });
+      trackingClient?.terminate();
+      void nativeMouseCommands.invalidateAndRelease().catch((error: unknown) => {
+        console.error(error);
+      });
     };
-  }, []);
+  }, [nativeMouseCommands]);
 
   return (
     <div className="app-shell">
@@ -819,9 +974,10 @@ function App() {
                 className={`switch ${settings.enableCursor ? 'on' : ''}`}
                 aria-label="Enable pointer movement"
                 aria-pressed={settings.enableCursor}
-                onClick={() =>
-                  setSettings((current) => ({ ...current, enableCursor: !current.enableCursor }))
-                }
+                onClick={() => changeInputSettings({
+                  ...settings,
+                  enableCursor: !settings.enableCursor,
+                })}
               >
                 <span />
               </button>
@@ -850,12 +1006,10 @@ function App() {
                 aria-label="Enable pinch click and hold-to-drag"
                 aria-pressed={settings.enablePinchActions}
                 disabled={!settings.enableCursor}
-                onClick={() =>
-                  setSettings((current) => ({
-                    ...current,
-                    enablePinchActions: !current.enablePinchActions,
-                  }))
-                }
+                onClick={() => changeInputSettings({
+                  ...settings,
+                  enablePinchActions: !settings.enablePinchActions,
+                })}
               >
                 <span />
               </button>

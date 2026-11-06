@@ -6,6 +6,7 @@ import {
   filterCursorTarget,
   mapNormalizedToScreen,
   PINCH_DRAG_HOLD_MS,
+  toPhysicalScreenCoordinates,
   updatePinchAction,
   type PinchActionState,
 } from './mouseMath';
@@ -47,6 +48,55 @@ describe('mapNormalizedToScreen', () => {
 
     expect(left.x).toBeLessThan(960);
     expect(mirroredLeft.x).toBeGreaterThan(960);
+  });
+
+  it('clamps out-of-range landmarks to the primary-display edges', () => {
+    const calibration = {
+      centerX: 640,
+      centerY: 360,
+      width: 1280,
+      height: 720,
+      screen: { width: 1920, height: 1080 },
+    };
+
+    expect(mapNormalizedToScreen({ x: -1, y: -1 }, { width: 1280, height: 720 }, calibration, 1))
+      .toEqual({ x: 0, y: 0 });
+    expect(mapNormalizedToScreen({ x: 2, y: 2 }, { width: 1280, height: 720 }, calibration, 1))
+      .toEqual({ x: 1920, y: 1080 });
+  });
+});
+
+describe('toPhysicalScreenCoordinates', () => {
+  it.each([1, 1.25, 1.5, 2])('maps screen center at %sx scaling', (scale) => {
+    expect(toPhysicalScreenCoordinates(
+      { x: 960, y: 540 },
+      { width: 1920, height: 1080 },
+      scale,
+    )).toEqual({ x: 960 * scale, y: 540 * scale });
+  });
+
+  it('converts CSS-pixel coordinates to physical pixels at display scaling', () => {
+    expect(toPhysicalScreenCoordinates(
+      { x: 800, y: 450 },
+      { width: 1536, height: 864 },
+      1.25,
+    )).toEqual({ x: 1000, y: 563 });
+  });
+
+  it('clamps to the last addressable primary-display pixel', () => {
+    expect(toPhysicalScreenCoordinates(
+      { x: 1536, y: 864 },
+      { width: 1536, height: 864 },
+      1.5,
+    )).toEqual({ x: 2303, y: 1295 });
+  });
+
+  it('uses unscaled coordinates for an invalid device-pixel ratio', () => {
+    expect(toPhysicalScreenCoordinates(
+      { x: 40, y: 20 },
+      { width: 100, height: 50 },
+      Number.NaN,
+    )).toEqual({ x: 40, y: 20 });
   });
 });
 
