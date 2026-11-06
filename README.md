@@ -145,6 +145,7 @@ dotnet publish .\native\GestureMouse.TrayHost\GestureMouse.TrayHost.csproj -c Re
 ```
 
 GitHub Actions runs the frontend checks, builds the cursor companion, runs the native command-state scenarios, and publishes the tray app for pushes and pull requests to `main`.
+```
 
 To publish the self-contained Windows x64 app as in the release workflow, build the frontend first:
 
