@@ -5,15 +5,7 @@ import wasmLoaderUrl from '@mediapipe/tasks-vision/vision_wasm_internal.js?url';
 import wasmBinaryUrl from '@mediapipe/tasks-vision/vision_wasm_internal.wasm?url';
 import wasmNoSimdLoaderUrl from '@mediapipe/tasks-vision/vision_wasm_nosimd_internal.js?url';
 import wasmNoSimdBinaryUrl from '@mediapipe/tasks-vision/vision_wasm_nosimd_internal.wasm?url';
-
-type WorkerRequest =
-  | { type: 'init' }
-  | { type: 'frame'; bitmap: ImageBitmap };
-
-type WorkerResponse =
-  | { type: 'ready' }
-  | { type: 'result'; landmarks: Array<{ x: number; y: number }> | null }
-  | { type: 'error'; message: string };
+import type { WorkerRequest, WorkerResponse } from '../lib/handTrackingProtocol';
 
 let handLandmarker: HandLandmarker | null = null;
 let initialization: Promise<void> | null = null;
@@ -63,10 +55,11 @@ async function initialize(): Promise<void> {
 }
 
 workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
+  const { session, requestId } = event.data;
   try {
     if (event.data.type === 'init') {
       await initialize();
-      workerScope.postMessage({ type: 'ready' } satisfies WorkerResponse);
+      workerScope.postMessage({ type: 'ready', session, requestId } satisfies WorkerResponse);
       return;
     }
 
@@ -75,12 +68,23 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       await initialize();
       const result = handLandmarker!.detectForVideo(bitmap, performance.now());
       const landmarks = result.landmarks[0]?.map(({ x, y }) => ({ x, y })) ?? null;
-      workerScope.postMessage({ type: 'result', landmarks } satisfies WorkerResponse);
+      workerScope.postMessage({
+        type: 'result',
+        landmarks,
+        session: event.data.session,
+        requestId,
+      } satisfies WorkerResponse);
     } finally {
       bitmap.close();
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    workerScope.postMessage({ type: 'error', message } satisfies WorkerResponse);
+    workerScope.postMessage({
+      type: 'error',
+      message,
+      session,
+      requestId,
+      phase: event.data.type,
+    } satisfies WorkerResponse);
   }
 };

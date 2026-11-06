@@ -1,6 +1,24 @@
 export type Point2D = { x: number; y: number };
 export type ScreenBounds = { width: number; height: number };
 
+// Convert WebView CSS pixels to the physical pixels accepted by the PMv2-aware native bridge.
+export function toPhysicalScreenCoordinates(
+  point: Point2D,
+  screen: ScreenBounds,
+  devicePixelRatio: number,
+): Point2D {
+  const scale = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0
+    ? devicePixelRatio
+    : 1;
+  const width = Math.max(1, Math.round(screen.width * scale));
+  const height = Math.max(1, Math.round(screen.height * scale));
+
+  return {
+    x: clamp(Math.round(point.x * scale), 0, width - 1),
+    y: clamp(Math.round(point.y * scale), 0, height - 1),
+  };
+}
+
 export type CalibratedScreen = {
   centerX: number;
   centerY: number;

@@ -32,6 +32,8 @@ The Windows desktop app runs in the notification area when its window is closed.
 
 ## Screenshots & demo
 
+Glimouse runs on 64-bit Windows and requires the Microsoft Edge WebView2 Runtime and a webcam.
+The latest published release is `v0.1.0`.
 > **Screenshot placeholder:** The repository does not currently include an authentic Glimouse interface screenshot or demo recording. A useful first addition would show the live camera preview with its landmark overlay alongside the movement, pinch, and scroll controls. A short real-use recording could demonstrate pointer movement and the optional gestures. No mockup is presented as a screenshot.
 
 ## How it works
@@ -55,6 +57,10 @@ flowchart LR
         WebView --> UI
     end
 
+```powershell
+$version = "vX.Y.Z"
+git tag $version
+git push origin $version
     UI -->|HTTP to 127.0.0.1:5103| TrayBridge
     UI -->|HTTP to 127.0.0.1:5103 in development| Companion[Cursor companion]
     TrayBridge --> Win32[Windows user32.dll]
@@ -137,6 +143,13 @@ These commands are defined by the project scripts and Windows workflows:
 npm run lint
 npm test
 npm run build
+dotnet build .\native\GestureMouse.CursorCompanion\GestureMouse.CursorCompanion.csproj
+dotnet build .\native\GestureMouse.TrayHost\GestureMouse.TrayHost.csproj
+dotnet run --project .\native\GestureMouse.CommandState.Tests\GestureMouse.CommandState.Tests.csproj --configuration Release
+dotnet publish .\native\GestureMouse.TrayHost\GestureMouse.TrayHost.csproj -c Release -r win-x64 --self-contained false
+```
+
+GitHub Actions runs the frontend checks, builds the cursor companion, runs the native command-state scenarios, and publishes the tray app for pushes and pull requests to `main`.
 ```
 
 To publish the self-contained Windows x64 app as in the release workflow, build the frontend first:
