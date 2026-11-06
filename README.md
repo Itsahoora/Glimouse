@@ -32,9 +32,7 @@ The Windows desktop app runs in the notification area when its window is closed.
 
 ## Screenshots & demo
 
-Glimouse runs on 64-bit Windows and requires the Microsoft Edge WebView2 Runtime and a webcam.
-The latest published release is `v0.1.0`.
-> **Screenshot placeholder:** The repository does not currently include an authentic Glimouse interface screenshot or demo recording. A useful first addition would show the live camera preview with its landmark overlay alongside the movement, pinch, and scroll controls. A short real-use recording could demonstrate pointer movement and the optional gestures. No mockup is presented as a screenshot.
+The repository does not currently include an authentic Glimouse interface screenshot or demo recording. A useful first addition would show the live camera preview with its landmark overlay alongside the movement, pinch, and scroll controls. A short real-use recording could demonstrate pointer movement and the optional gestures. No mockup is presented as a screenshot.
 
 ## How it works
 
@@ -57,10 +55,6 @@ flowchart LR
         WebView --> UI
     end
 
-```powershell
-$version = "vX.Y.Z"
-git tag $version
-git push origin $version
     UI -->|HTTP to 127.0.0.1:5103| TrayBridge
     UI -->|HTTP to 127.0.0.1:5103 in development| Companion[Cursor companion]
     TrayBridge --> Win32[Windows user32.dll]
@@ -140,6 +134,7 @@ The companion is for browser development. Do not start it alongside the tray app
 These commands are defined by the project scripts and Windows workflows:
 
 ```powershell
+npm ci
 npm run lint
 npm test
 npm run build
@@ -158,7 +153,17 @@ To publish the self-contained Windows x64 app as in the release workflow, build 
 dotnet publish .\native\GestureMouse.TrayHost\GestureMouse.TrayHost.csproj --configuration Release --runtime win-x64 --self-contained true
 ```
 
-The publish output is written under `native\GestureMouse.TrayHost\bin\Release\net10.0-windows\win-x64\publish\`. Pushing a new tag matching `v*` runs the release workflow, which lints, tests, builds, packages the self-contained app with the MIT license, and creates a GitHub Release.
+The publish output is written under `native\GestureMouse.TrayHost\bin\Release\net10.0-windows\win-x64\publish\`.
+
+### Create a release
+
+Pushing a version tag matching `v*` runs the release workflow. The latest published release remains `v0.1.0`; v0.1.1 is prepared but has not been published.
+
+```powershell
+$version = "vX.Y.Z"
+git tag $version
+git push origin $version
+```
 
 ## Project structure
 
@@ -169,14 +174,16 @@ The publish output is written under `native\GestureMouse.TrayHost\bin\Release\ne
 │   ├── workers/handTracking.worker.ts  # MediaPipe inference worker
 │   └── lib/
 │       ├── mouseMath.ts                # Gesture detection and cursor mapping/filtering
-│       └── mouseMath.test.ts            # Gesture and cursor-mapping unit tests
+│       └── mouseMath.test.ts           # Gesture and cursor-mapping unit tests
 ├── native/
 │   ├── GestureMouse.TrayHost/          # Windows Forms, WebView2, and embedded bridge
-│   └── GestureMouse.CursorCompanion/   # Standalone bridge for browser development
+│   ├── GestureMouse.CursorCompanion/   # Standalone bridge for browser development
+│   └── GestureMouse.CommandState.Tests/ # Native command-state regression tests
 ├── .github/workflows/
 │   ├── ci.yml                          # Windows checks and publish artifact
 │   └── release.yml                     # Tagged Windows release packaging
 ├── package.json                        # Frontend scripts and dependencies
+├── CHANGELOG.md                        # Release notes
 └── LICENSE                             # MIT License
 ```
 
@@ -194,12 +201,25 @@ The publish output is written under `native\GestureMouse.TrayHost\bin\Release\ne
 - One hand is tracked at a time. Tracking quality depends on camera visibility, lighting, and the hand being in view.
 - The model is not bundled, so first-time tracking requires an internet connection.
 - Browser development needs the separate .NET companion for cursor control. Camera preview and hand tracking can run without it.
-- Tests cover cursor-mapping and gesture logic; the repository does not include automated end-to-end camera or physical mouse-control tests.
+- Automated tests cover frontend gesture and mouse-safety logic, worker lifecycle, and native command-state scenarios; the repository does not include end-to-end camera or physical mouse-control tests.
 - Glimouse exposes left-click, drag, and wheel scrolling; it does not implement right-click or arbitrary mouse buttons.
 
 ## Roadmap
 
-No roadmap items are currently documented in the repository.
+| Version | Focus |
+| --- | --- |
+| v0.1.x | Bug fixes and stability |
+| v0.2.0 | Improved gesture recognition |
+| v0.3.0 | Better calibration and multi-monitor support |
+| v0.4.0 | Customizable gestures |
+| v0.5.0 | Performance improvements |
+| v1.0.0 | Stable public release |
+
+These are planned areas of focus, not features currently available in the app.
+
+## Release notes
+
+See [CHANGELOG.md](./CHANGELOG.md) for the v0.1.1 release notes.
 
 ## Contributing
 
